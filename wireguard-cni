@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -x
+
+input_config=$(mktemp -t wireguard-plugin.XXXXXX)
+wg_config=$(mktemp -t wireguard-conf.XXXXXX)
+cat > "${input_config}"
+
+function cleanup {
+    rm $input_config
+    rm $wg_config
+}
+trap cleanup EXIT
+
+exec 3>&1
+
+exec 1>&2
+
+
+WG_HOST=wg_host
+#NETNS=$(basename ${CNI_NETNS})
+CNI_VERSION="0.4.0"
+
+cat > "${wg_config}" <<__wg_conf__
+[Interface]
+PrivateKey = 
+#Address = 
+#DNS = 
+
+[Peer]
+PublicKey = 
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = 
+PresharedKey = 
+__wg_conf__
+endpoints=$(sed -ne 's|^\s*Endpoint\s*=\s*\([^:\S]\+\)\s*:.*|\1|p' ${wg_config})
+for endpoint in $endpoints; do
+    sed -i -e"s/${endpoint}/$(getent ahostsv4 "${endpoint}"|awk '{print $1}'|head -n1)/" ${wg_config}
+
+done
+
+address="X.X.X.X/32"
+allowed_ips=( "0.0.0.0/0" "::/0" )
+dns=( "8.8.8.8" )
+mtu=1420
+
+case "${CNI_COMMAND}" in
+    ADD)
+        tmpif=wgtmp$RANDOM
+        ip link add "${tmpif}" type wireguard
+        ip link set name "${CNI_IFNAME}" netns "${CNI_NETNS}" dev "$tmpif"
+        nsenter -n"${CNI_NETNS}" wg setconf "${CNI_IFNAME}" "${wg_config}"
+        nsenter -n"${CNI_NETNS}" ip -4 address add "${address}" dev "${CNI_IFNAME}"
+        nsenter -n"${CNI_NETNS}" ip link set mtu "${mtu}" up dev "${CNI_IFNAME}"
+
+        for dst_range in "${allowed_ips[@]}"; do
+            if ( echo -n "${dst_range}" | grep -q ':' ); then
+                nsenter -n"${CNI_NETNS}" ip -6 route replace "${dst_range}" dev "${CNI_IFNAME}"
+            else
+                nsenter -n"${CNI_NETNS}" ip -4 route replace "${dst_range}" dev "${CNI_IFNAME}"
+            fi
+        done
+        cat|tee -a /dev/stderr>&3 <<__ADD_RESULT__
+{
+    "cniVersion": "${CNI_VERSION}",
+    "interfaces": [
+        {
+            "name": "${CNI_IFNAME}",
+            "mtu": ${mtu},
+            "sandbox": "${CNI_NETNS}"
+        }
+    ],
+    "ips": [
+        { "address": "${address}", "interface": 0 }
+    ],
+    "routes": [
+$(for i in `seq 0 "$[${#allowed_ips[@]}-1]"`;do echo -n "        {\"dst\": \"${allowed_ips[$i]}\"}"; if [ "$i" -ne "$[${#allowed_ips[@]}-1]" ];then echo ,;fi; done)
+    ],
+    "dns": {
+        "nameservers": [
+$(for i in `seq 0 "$[${#dns[@]}-1]"`;do echo -n "            \"${dns[$i]}\""; if [ "$i" -ne "$[${#dns[@]}-1]" ];then echo ,;fi; done)
+        ]
+    }
+}
+__ADD_RESULT__
+        ;;
+    DEL)
+        if [ -n "$CNI_NETNS" ]; then
+            nsenter -n"${CNI_NETNS}" ip link delete "${CNI_IFNAME}" type wireguard
+        fi
+        ;;
+    CHECK)
+        ;;
+    GC)
+        ;;
+    VERSION)
+        cat <<__VERSION_RESULT__
+{
+    "cniVersion": "${CNI_VERSION}",
+    "supportedVersions": [ "0.1.0", "0.2.0", "0.3.0", "0.3.1", "0.4.0" ]
+}
+__VERSION_RESULT__
+        ;;
+    *)  cat <<__UNK_RESULT__
+{
+  "cniVersion": "${CNI_VERSION}",
+  "code": 4,
+  "msg": "Invalid necessary environment variable CNI_COMMAND",
+  "details": "CNI_COMMAND='${CNI_COMMAND}' is not recognized"
+}
+__UNK_RESULT__
+        exit -1
+        ;;
+esac
+
+#infosphere:~/dockers/wireguard# wg setconf tmp0  <(cat wg.conf)
+#infosphere:~/dockers/wireguard# nerdctl run --privileged --rm -it --net wg0 --dns 8.8.8.8 alpine:latest sh
